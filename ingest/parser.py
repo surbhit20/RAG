@@ -34,7 +34,9 @@ def parse_pdf(pdf_path: Path, book_key: str) -> str:
         language="en",
     )
     documents = parser.load_data(str(pdf_path))
-    full_markdown = "\n\n".join(doc.text for doc in documents)
+    # Each Document = one page — inject page markers so chunker can track pages
+    pages = [f"<!-- page {i + 1} -->\n{doc.text}" for i, doc in enumerate(documents)]
+    full_markdown = "\n\n".join(pages)
     cache_file.write_text(full_markdown, encoding="utf-8")
     print(f"[cached] → {cache_file}")
     return full_markdown

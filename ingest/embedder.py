@@ -90,6 +90,9 @@ def embed_and_upsert(chunks) -> None:
     texts = [c.text for c in chunks]
     bm25 = _fit_bm25(texts)
 
+    # Safety: drop any chunks with empty text before they reach OpenAI
+    chunks = [c for c in chunks if c.text.strip()]
+    texts = [c.text for c in chunks]
     total = len(chunks)
     batches = _token_aware_batches(chunks, texts)
     print(f"\n[embed] {total} chunks → {len(batches)} token-aware batches...")

@@ -62,3 +62,117 @@ def stream_answer(
     ) as stream:
         for text in stream.text_stream:
             yield text
+
+
+# ── MCP / Agentic tool-use ────────────────────────────────────────────────────
+
+SEARCH_TOOL = {
+    "name": "search_ml_books",
+    "description": (
+        "Search the 3 ML textbooks (Géron Hands-on ML, Goodfellow Deep Learning, "
+        "Hands-On LLMs) using hybrid retrieval + cross-encoder reranking. "
+        "Call this when the question asks about ML concepts, algorithms, or content "
+        "from these books. Skip for conversational follow-ups already answered in context."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Search query — rephrase the user's question for best retrieval.",
+            },
+            "top_k": {"type": "integer", "default": 20},
+            "top_n": {"type": "integer", "default": 5},
+            "alpha": {"type": "number", "default": 0.75},
+        },
+        "required": ["query"],
+    },
+}
+
+
+def agentic_stream_answer(
+    query: str,
+    history: list[dict],
+    top_k: int = HYBRID_TOP_K,
+    top_n: int = RERANK_TOP_N,
+    alpha: float = HYBRID_ALPHA,
+) -> Generator:
+    """
+    Agentic RAG: Claude decides whether to call the search tool.
+
+    Yields:
+        str  — text tokens for the streaming answer
+        dict — {"type": "hits", "data": list[dict]} — emitted once if search ran,
+               so app.py can capture hits for the sources panel
+    """
+    import anthropic
+
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    messages = history + [{"role": "user", "content": query}]
+
+    # ── Turn 1: let Claude decide whether to search ───────────────────────────
+    tool_use_block = None
+    text_tokens_turn1 = []
+
+    with client.messages.stream(
+        model=CLAUDE_MODEL,
+        max_tokens=MAX_TOKENS,
+        system=SYSTEM_PROMPT,
+        tools=[SEARCH_TOOL],
+        messages=messages,
+    ) as stream:
+        for event in stream:
+            # Capture text tokens in case Claude answers directly (no tool call)
+            if (
+                hasattr(event, "type")
+                and event.type == "content_block_delta"
+                and hasattr(event, "delta")
+                and hasattr(event.delta, "type")
+                and event.delta.type == "text_delta"
+            ):
+                text_tokens_turn1.append(event.delta.text)
+        final_msg = stream.get_final_message()
+
+    # Check if Claude decided to call the search tool
+    for block in final_msg.content:
+        if block.type == "tool_use":
+            tool_use_block = block
+            break
+
+    # ── Path A: Claude answered directly — no search needed ───────────────────
+    if tool_use_block is None:
+        yield from text_tokens_turn1
+        return
+
+    # ── Path B: Claude called the tool — run retrieval ────────────────────────
+    tool_input = tool_use_block.input
+    hits = retrieve_and_rerank(
+        query=tool_input.get("query", query),
+        top_k=tool_input.get("top_k", top_k),
+        top_n=tool_input.get("top_n", top_n),
+        alpha=tool_input.get("alpha", alpha),
+    )
+
+    # Emit hits so app.py can populate the sources panel
+    yield {"type": "hits", "data": hits}
+
+    # Append tool_use + tool_result to message history
+    messages.append({"role": "assistant", "content": final_msg.content})
+    messages.append({
+        "role": "user",
+        "content": [{
+            "type": "tool_result",
+            "tool_use_id": tool_use_block.id,
+            "content": _build_context(hits) if hits else "No relevant passages found.",
+        }],
+    })
+
+    # ── Turn 2: stream the final grounded answer ──────────────────────────────
+    with client.messages.stream(
+        model=CLAUDE_MODEL,
+        max_tokens=MAX_TOKENS,
+        system=SYSTEM_PROMPT,
+        messages=messages,
+    ) as stream:
+        for text in stream.text_stream:
+            yield text

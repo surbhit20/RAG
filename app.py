@@ -15,7 +15,7 @@ st.set_page_config(
 # ── Sidebar ──────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("📚 ML Books RAG")
-    st.caption("Powered by Claude claude-sonnet-4-6 · Pinecone Hybrid Search · Cross-Encoder Reranking")
+    st.caption("Powered by Claude Sonnet · Pinecone Hybrid Search · Cross-Encoder Reranking")
     st.divider()
 
     st.subheader("Retrieval Settings")
@@ -26,6 +26,20 @@ with st.sidebar:
     )
     top_k = st.slider("Candidates to retrieve", min_value=5, max_value=30, value=20)
     top_n = st.slider("Chunks after reranking", min_value=3, max_value=10, value=5)
+
+    st.divider()
+    st.subheader("Pipeline Mode")
+    mode = st.radio(
+        "Mode",
+        options=["Fixed Pipeline", "Agentic Mode"],
+        index=0,
+        help=(
+            "Fixed Pipeline: always retrieves then answers.\n\n"
+            "Agentic Mode (MCP): Claude decides whether to search — "
+            "skips retrieval for follow-ups already in context."
+        ),
+        label_visibility="collapsed",
+    )
 
     st.divider()
     st.subheader("Books indexed")
@@ -76,7 +90,10 @@ with col_sources:
                 if "rerank_score" in hit:
                     st.caption(f"Rerank score: {hit['rerank_score']:.3f}")
     else:
-        st.caption("Sources will appear here after your first question.")
+        if mode == "Agentic Mode":
+            st.caption("Sources appear here when Claude searches. Follow-up questions may not trigger a search.")
+        else:
+            st.caption("Sources will appear here after your first question.")
 
 # ── Chat panel ────────────────────────────────────────────────────────────────
 with col_chat:
@@ -90,55 +107,74 @@ with col_chat:
 
     # Chat input
     if prompt := st.chat_input("e.g. What is backpropagation? How does attention work?"):
-        # Show user message
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
 
-        # Phase 1: retrieve + rerank (synchronous, fast ~0.5–1.5s)
-        with st.spinner("Searching books…"):
-            try:
-                from rag.engine import retrieve_and_rerank, stream_answer
-                hits = retrieve_and_rerank(
-                    query=prompt,
-                    top_k=top_k,
-                    top_n=top_n,
-                    alpha=alpha,
-                )
-                st.session_state.sources = hits
-            except Exception as e:
-                err_str = str(e)
-                if "NOT_FOUND" in err_str or "not found" in err_str.lower():
-                    st.error(
-                        "**Pinecone index not found.**\n\n"
-                        "You need to run the ingest pipeline first:\n"
-                        "```\n"
-                        "source venv/bin/activate\n"
-                        "python -m ingest.parser    # parse PDFs (20–40 min)\n"
-                        "python -m ingest.chunker   # detect chapters\n"
-                        "python -m ingest.embedder  # embed + upload to Pinecone\n"
-                        "```"
+        history = st.session_state.memory.get_messages()
+
+        # ── Fixed Pipeline ────────────────────────────────────────────────────
+        if mode == "Fixed Pipeline":
+            with st.spinner("Searching books…"):
+                try:
+                    from rag.engine import retrieve_and_rerank, stream_answer
+                    hits = retrieve_and_rerank(
+                        query=prompt, top_k=top_k, top_n=top_n, alpha=alpha,
                     )
-                else:
-                    st.error(f"Retrieval error: {e}")
-                st.stop()
+                    st.session_state.sources = hits
+                except Exception as e:
+                    err_str = str(e)
+                    if "NOT_FOUND" in err_str or "not found" in err_str.lower():
+                        st.error(
+                            "**Pinecone index not found.**\n\n"
+                            "Run the ingest pipeline first:\n"
+                            "```\nsource venv/bin/activate\n"
+                            "python -m ingest.parser\n"
+                            "python -m ingest.chunker\n"
+                            "python -m ingest.embedder\n```"
+                        )
+                    else:
+                        st.error(f"Retrieval error: {e}")
+                    st.stop()
 
-        # Refresh sources panel immediately (rerun needed — use a placeholder instead)
-        # Phase 2: stream LLM answer
-        with st.chat_message("assistant"):
-            history = st.session_state.memory.get_messages()
-            try:
-                full_response = st.write_stream(
-                    stream_answer(prompt, hits, history)
-                )
-            except Exception as e:
-                st.error(f"Generation error: {e}")
-                st.stop()
+            with st.chat_message("assistant"):
+                try:
+                    full_response = st.write_stream(stream_answer(prompt, hits, history))
+                except Exception as e:
+                    st.error(f"Generation error: {e}")
+                    st.stop()
 
-        # Persist to session state
+        # ── Agentic Mode (MCP tool use) ───────────────────────────────────────
+        else:
+            from rag.engine import agentic_stream_answer
+
+            # Wrapper generator: intercepts hits dict, passes text tokens to st.write_stream
+            hits_holder = []
+
+            def _text_stream():
+                try:
+                    for item in agentic_stream_answer(
+                        query=prompt,
+                        history=history,
+                        top_k=top_k,
+                        top_n=top_n,
+                        alpha=alpha,
+                    ):
+                        if isinstance(item, dict) and item.get("type") == "hits":
+                            hits_holder.append(item["data"])  # captured for sources panel
+                        else:
+                            yield item  # text token → st.write_stream
+                except Exception as e:
+                    yield f"\n\n⚠️ Error: {e}"
+
+            with st.chat_message("assistant"):
+                full_response = st.write_stream(_text_stream())
+
+            # Update sources panel (empty if Claude answered without searching)
+            st.session_state.sources = hits_holder[0] if hits_holder else []
+
+        # ── Persist to session state ──────────────────────────────────────────
         st.session_state.messages.append({"role": "assistant", "content": full_response})
         st.session_state.memory.add("user", prompt)
         st.session_state.memory.add("assistant", full_response)
-
-        # Rerun to refresh sources panel with the new hits
         st.rerun()

@@ -46,11 +46,14 @@ class Chunk:
     text: str
     start_page: int
     end_page: int
+    section_index: int = 0          # sequential section counter within the book
     chunk_id: str = field(init=False)
 
     def __post_init__(self):
+        # section_index guarantees global uniqueness even when chapter_number repeats
         self.chunk_id = (
-            f"{self.book_key}_ch{self.chapter_number:02d}_chunk{self.chunk_index:03d}"
+            f"{self.book_key}_ch{self.chapter_number:02d}"
+            f"_s{self.section_index:03d}_c{self.chunk_index:03d}"
         )
 
 
@@ -159,12 +162,15 @@ def chunk_book(book_key: str, markdown: str) -> list[Chunk]:
     book_name = BOOK_DISPLAY_NAMES.get(book_key, book_key)
     chunks: list[Chunk] = []
 
-    for offset, heading, section_text in sections:
+    for section_idx, (offset, heading, section_text) in enumerate(sections):
         chapter_number = _extract_chapter_number(heading)
         chapter_title = _clean_heading_title(heading)
         start_page = _page_at(page_map, offset)
 
         if _count_tokens(section_text) <= CHAPTER_TOKEN_LIMIT:
+            cleaned = section_text.strip()
+            if not cleaned:
+                continue
             end_page = _page_at(page_map, offset + len(section_text))
             chunks.append(Chunk(
                 book_key=book_key,
@@ -173,15 +179,20 @@ def chunk_book(book_key: str, markdown: str) -> list[Chunk]:
                 chapter_title=chapter_title,
                 chunk_index=0,
                 total_chunks=1,
-                text=section_text.strip(),
+                text=cleaned,
                 start_page=start_page,
                 end_page=end_page,
+                section_index=section_idx,
             ))
         else:
             sub_texts = _sub_chunk(section_text, CHAPTER_TOKEN_LIMIT, CHUNK_OVERLAP_TOKENS)
             total = len(sub_texts)
             char_cursor = offset
             for idx, sub_text in enumerate(sub_texts):
+                cleaned = sub_text.strip()
+                if not cleaned:
+                    char_cursor += len(sub_text)
+                    continue
                 end_page = _page_at(page_map, char_cursor + len(sub_text))
                 chunks.append(Chunk(
                     book_key=book_key,
@@ -190,9 +201,10 @@ def chunk_book(book_key: str, markdown: str) -> list[Chunk]:
                     chapter_title=chapter_title,
                     chunk_index=idx,
                     total_chunks=total,
-                    text=sub_text.strip(),
+                    text=cleaned,
                     start_page=_page_at(page_map, char_cursor),
                     end_page=end_page,
+                    section_index=section_idx,
                 ))
                 char_cursor += len(sub_text)
 

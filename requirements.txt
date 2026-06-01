@@ -10,3 +10,4 @@ streamlit>=1.38.0
 sentence-transformers>=3.0.0
 tiktoken>=0.7.0
 python-dotenv>=1.0.0
+mcp>=1.0.0
